@@ -1,0 +1,270 @@
+#!/bin/bash
+#
+# Simple script to make a restic backup of a system.
+# Splits the filesystem into different "sections" to allow for backup schedules and
+# different retention policies to be applied (if required).
+#
+# Result and some stats are published to MQTT to allow monitoring by Home Assistant
+#
+# As is fairly usual, most code deals with MQTT discovery for HA and parsing the non-JSON
+# output from some restic commands!
+#
+# Chris Burrows
+#
+
+DIR=$(dirname $0)
+
+TYPE=$1
+HOST=$(uname -n)
+#DRYRUN="--verbose --dry-run"
+
+. ../etc/backup.env
+
+mqtt_user=${MQTT_USER}
+mqtt_password=${MQTT_PASSWORD}
+mqtt_topic="restic"
+mqtt_host="mqtt.home"
+
+export RESTIC_PASSWORD_FILE="/usr/local/etc/.restic/password"
+export RESTIC_REPOSTITORY_FILE="/usr/local/etc/.restic/repository"
+
+RESTIC="/usr/local/bin/restic --repository-file ${RESTIC_REPOSTITORY_FILE}"
+TEMPFILE=$(mktemp)
+
+trap 'rm -f ${TEMPFILE}' 0 1 2 3 15
+
+# global to track the exit code from restic commands
+# returning more than one value from a shell function is a pain
+# so we use a global & side effects to report it!
+restic_status=0
+restic_version=$(restic version | awk '{print$2}')
+
+discovery_device() {
+        local ID="restic-${HOST}"
+        echo "\"device\": {\"identifiers\": [ \"${ID}\" ], \"name\": \"Restic Backup ${HOST}\", \"manufacturer\": \"restic\", \"sw_version\": \"${restic_version}\"}"
+}
+
+discovery_backup_sensor() {
+	local backup_tag=$1
+	local device="$2"
+
+	local discovery_topic="homeassistant/sensor/restic-${HOST}-${backup_tag}/config"
+	local state_topic="${mqtt_topic}/backup/${HOST}/${backup_tag}"
+	local unique_id="restic_${HOST}_${backup_tag}"
+	local entity_id=${unique_id}
+
+        json="{\"name\": \"${backup_tag}\", \"unique_id\": \"${unique_id}\", \"object_id\": \"${entity_id}\", \"state_topic\": \"${state_topic}\", \"value_template\": \"{{value_json.status}}\", \"json_attributes_topic\": \"${state_topic}\", ${device} }"
+
+	echo ${json} | mosquitto_pub -r -q 1 -h ${mqtt_host} -u ${mqtt_user} -P "${mqtt_password}" -t "${discovery_topic}" -l 
+}
+
+discovery_stats_sensor() {
+	local discovery_topic="homeassistant/sensor/restic-repo-stats/config"
+	local state_topic="${mqtt_topic}/stats"
+	local unique_id="restic_repo_stats"
+	local entity_id=${unique_id}
+        local device=$(echo "\"device\": {\"identifiers\": [ \"qnap_restic_repo\" ], \"name\": \"Restic QNAP Repository\", \"manufacturer\": \"restic\", \"sw_version\": \"${restic_version}\"}")
+
+        json="{\"name\": \"Repo Stats\", \"unique_id\": \"${unique_id}\", \"object_id\": \"${entity_id}\", \"state_topic\": \"${state_topic}\", \"value_template\": \"{{value_json.status}}\", \"json_attributes_topic\": \"${state_topic}\", ${device} }"
+
+	echo ${json} | mosquitto_pub -r -q 1 -h ${mqtt_host} -u ${mqtt_user} -P "${mqtt_password}" -t "${discovery_topic}" -l 
+}
+
+discovery_raw_stats_sensor() {
+	local discovery_topic="homeassistant/sensor/restic-repo-raw-stats/config"
+	local state_topic="${mqtt_topic}/raw_stats"
+	local unique_id="restic_repo_raw_stats"
+	local entity_id=${unique_id}
+        local device=$(echo "\"device\": {\"identifiers\": [ \"qnap_restic_repo\" ], \"name\": \"Restic QNAP Repository\", \"manufacturer\": \"restic\", \"sw_version\": \"${restic_version}\"}")
+
+        json="{\"name\": \"Repo Raw Stats\", \"unique_id\": \"${unique_id}\", \"object_id\": \"${entity_id}\", \"state_topic\": \"${state_topic}\", \"value_template\": \"{{value_json.status}}\", \"json_attributes_topic\": \"${state_topic}\", ${device} }"
+
+	echo ${json} | mosquitto_pub -r -q 1 -h ${mqtt_host} -u ${mqtt_user} -P "${mqtt_password}" -t "${discovery_topic}" -l 
+}
+
+discovery_forget_stats_sensor() {
+	local discovery_topic="homeassistant/sensor/restic-repo-forget/config"
+	local state_topic="${mqtt_topic}/forget"
+	local unique_id="restic_repo_forget"
+	local entity_id=${unique_id}
+        local device=$(echo "\"device\": {\"identifiers\": [ \"qnap_restic_repo\" ], \"name\": \"Restic QNAP Repository\", \"manufacturer\": \"restic\", \"sw_version\": \"${restic_version}\"}")
+
+        json="{\"name\": \"Repo Forget\", \"unique_id\": \"${unique_id}\", \"object_id\": \"${entity_id}\", \"state_topic\": \"${state_topic}\", \"value_template\": \"{{value_json.status}}\", \"json_attributes_topic\": \"${state_topic}\", ${device} }"
+
+	echo ${json} | mosquitto_pub -r -q 1 -h ${mqtt_host} -u ${mqtt_user} -P "${mqtt_password}" -t "${discovery_topic}" -l 
+}
+
+discovery_prune_stats_sensor() {
+	local discovery_topic="homeassistant/sensor/restic-repo-prune/config"
+	local state_topic="${mqtt_topic}/prune"
+	local unique_id="restic_repo_prune"
+	local entity_id=${unique_id}
+        local device=$(echo "\"device\": {\"identifiers\": [ \"qnap_restic_repo\" ], \"name\": \"Restic QNAP Repository\", \"manufacturer\": \"restic\", \"sw_version\": \"${restic_version}\"}")
+
+        json="{\"name\": \"Repo Prune\", \"unique_id\": \"${unique_id}\", \"object_id\": \"${entity_id}\", \"state_topic\": \"${state_topic}\", \"value_template\": \"{{value_json.status}}\", \"json_attributes_topic\": \"${state_topic}\", ${device} }"
+
+	echo ${json} | mosquitto_pub -r -q 1 -h ${mqtt_host} -u ${mqtt_user} -P "${mqtt_password}" -t "${discovery_topic}" -l 
+	
+}
+
+ha_discovery() {
+	tag=$1
+
+	device_json=$(discovery_device)
+	discovery_backup_sensor ${tag} "${device_json}"
+}
+
+
+# publish result
+mqtt_publish() {
+	local what="$1"
+	local tag="$2"
+	local summary="$3"
+
+	local elapsed=$(( `date +%s` - ${start_epoch} ))
+
+	if [ ${restic_status} -eq 0 ]; then
+		status="success"
+	else
+		status="error"
+	fi
+	#local json="{\"epoch_time\": ${start_epoch}, \"time\": \"${start_iso}\", \"duration\": ${elapsed}, \"type\": \"${what}\", \"status\": \"${status}\", \"summary\": ${summary} }"
+	local json="{\"epoch_time\": ${start_epoch}, \"time\": \"${start_iso}\", \"duration\": ${elapsed}, \"type\": \"${what}\", \"status\": \"${status}\" }"
+	json=$(echo ${json} ${summary} | jq -s '.[0] * .[1]')
+
+	echo ${json} | mosquitto_pub -r -q 1 -h ${mqtt_host} -u ${mqtt_user} -P "${mqtt_password}" -t "${mqtt_topic}" -l
+	if [ "${what}" == "backup" ];
+	then
+		echo ${json} | mosquitto_pub -r -q 1 -h ${mqtt_host} -u ${mqtt_user} -P "${mqtt_password}" -t "${mqtt_topic}/${what}/${HOST}/${tag}" -l 
+	else
+		echo ${json} | mosquitto_pub -r -q 1 -h ${mqtt_host} -u ${mqtt_user} -P "${mqtt_password}" -t "${mqtt_topic}/${what}" -l 
+	fi
+}
+
+#
+# Run restic backup with some common arguments and grab the summary JSON data
+#
+restic_backup() {
+	local summary=$(${RESTIC} --json backup --no-scan --one-file-system "$@" ${DRYRUN} | grep '"message_type":"summary"')
+	restic_status=$?
+	echo ${summary}
+}
+
+mark_start() {
+	start_iso=$(date -Iminute)
+	start_epoch=$(date +%s)
+}
+
+do_prune() {
+	mark_start
+	discovery_prune_stats_sensor
+
+	local output=$(${RESTIC} ${what} ${DRYRUN})
+	restic_status=$?
+	if [ $? -eq 0 ]; then
+		local snapshot_count=$(echo "${output}" | awk '/finding data/ {print $9}')
+		local repack_count=$(echo "${output}" | awk '/to repack:/ {print $3}')
+		local removes_count=$(echo "${output}" | awk '/this removes:/ {print $3}')
+		local delete_count=$(echo "${output}" | awk '/to delete:/ {print $3}')
+		local remaining_count=$(echo "${output}" | awk '/remaining:/ {print $2}')
+		local unused=$(echo "${output}" | awk '/unused size/ {print $5}')
+		local unused_pct=$(echo "${output}" | awk '/unused size/ {print $7}' | sed -e 's/[(%]//g')
+
+		local summary="{\"snapshot_count\": ${snapshot_count}, \"blobs_repack\": ${repack_count}, \"blobs_removed\": ${removes_count}, \"blobs_delete\": ${delete_count}, \"blobs_remaining\": ${remaining_count}, \"unused_KiB\": ${unused}, \"unused_percent\": ${unused_pct}, \"error\": \"\" }"
+	else
+		local text=$(echo "${output}" | sed -e 's/"/\\\"/g')
+		local summary="{\"error\": \"${text}\"}"
+	fi
+
+	mqtt_publish prune "" "${summary}"
+}
+
+do_backup() {
+	local tag="$1"
+	local exclude=""
+
+	ha_discovery ${tag}
+
+	mark_start
+	if [[ ! -f ${DIR}/../etc/restic/${tag}.txt ]]; then
+		echo "Error: can't find tag list ${tag}"
+		return
+	fi
+	if [[ -f ${DIR}/../etc/restic/${tag}-exclude.txt ]]; then
+		exclude="--exclude-file=${DIR}/../etc/restic/${tag}-exclude.txt"
+	fi
+
+	local summary=$(restic_backup --tag=${tag} ${exclude} --files-from  ${DIR}/../etc/restic/${tag}.txt)
+	mqtt_publish backup ${tag} "${summary}"
+}
+
+do_forget() {
+	mark_start
+	discovery_forget_stats_sensor
+
+	${RESTIC} --json forget ${DRYRUN} --keep-within-hourly 7d --keep-within-daily 21d --keep-within-weekly 1m --keep-within-monthly 1y > ${TEMPFILE}
+	restic_status=$?
+
+	local keep_count=$(cat ${TEMPFILE} | jq 'map(.keep|length)|add') 
+	local remove_count=$(cat ${TEMPFILE} | jq 'map(.remove|length)|add') 
+
+	local summary="{\"keep\": ${keep_count}, \"delete\": ${remove_count}}"
+	mqtt_publish forget "" "${summary}"
+}
+
+do_stats() {
+	mark_start
+	discovery_stats_sensor
+	discovery_raw_stats_sensor
+
+	local free_bytes=$(ssh backup-host df -k . | awk '/share/ {print $2 * 1024}')
+	local summary=$(${RESTIC} --json stats )
+	restic_status=$?
+	mqtt_publish stats "" "${summary}"
+
+	mark_start
+	local summary=$(${RESTIC} --json stats --mode raw-data | jq ". +=  {\"free_bytes\": ${free_bytes}}" )
+	restic_status=$?
+	mqtt_publish raw_stats "" "${summary}"
+}
+
+manage_backup() {
+	for f in ${DIR}/../etc/restic/*.txt; do
+		if [[ $f =~ -exclude.txt ]]; then
+			echo Skipping exclude file
+			continue
+		fi
+		tag=$(basename $f | sed -e 's/.txt//')
+		do_backup ${tag}
+	done
+}
+
+what="$1"
+
+case ${what} in
+	backup)
+		manage_backup
+		;;
+
+	check|snapshots)
+		${RESTIC} ${what}
+		;;
+
+	prune)
+		do_prune
+		;;
+
+	forget)
+		do_forget
+		;;
+
+	stats)
+		do_stats
+		;;
+
+	*)	do_backup ${what}
+		;;
+
+esac
+
+exit 0
