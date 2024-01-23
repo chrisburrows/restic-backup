@@ -6,9 +6,6 @@
 #
 # Result and some stats are published to MQTT to allow monitoring by Home Assistant
 #
-# As is fairly usual, most code deals with MQTT discovery for HA and parsing the non-JSON
-# output from some restic commands!
-#
 # Chris Burrows
 #
 
@@ -38,6 +35,28 @@ trap 'rm -f ${TEMPFILE}' 0 1 2 3 15
 # so we use a global & side effects to report it!
 restic_status=0
 restic_version=$(restic version | awk '{print$2}')
+
+init_caps() {
+	str=$(echo $* | sed -e 's/_/ /g')
+	words=( $str )
+	ic=${words[@]^}
+	echo "${ic}"
+}
+
+device_class() {
+	local class=""
+	case "${1}" in
+		duration|total_duration) 
+			class="duration" 
+			;;
+		total_bytes_processed|data_added) 
+			class="data_size\","
+			;;
+		*) echo ""
+			;;
+	esac
+	[[ -n "${class}" ]] && echo "\"device_class\": \"${class}\"," 
+}
 
 discovery_device() {
         local ID="restic-${HOST}"
@@ -159,7 +178,7 @@ do_prune() {
 	mark_start
 	discovery_prune_stats_sensor
 
-	local output=$(${RESTIC} ${what} ${DRYRUN})
+	local output=$(${RESTIC} prune ${DRYRUN})
 	restic_status=$?
 	if [ $? -eq 0 ]; then
 		local snapshot_count=$(echo "${output}" | awk '/finding data/ {print $9}')
@@ -256,6 +275,11 @@ case ${what} in
 
 	forget)
 		do_forget
+		;;
+
+	forget-and-prune)
+		do_forget
+		do_prune
 		;;
 
 	stats)
